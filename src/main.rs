@@ -1,8 +1,13 @@
 use clap::Parser;
-use clap_derive::{Subcommand, ValueEnum};
-use reqwest::Url;
+use clap_derive::ValueEnum;
+use core::panic;
+use log::{debug, info, trace, LevelFilter};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::{Read, Write}, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 const LINKU_API: &str = "https://api.linku.la/v1/words";
 
@@ -16,7 +21,7 @@ const LINKU_API: &str = "https://api.linku.la/v1/words";
 // number=word in alpha order
 
 //cats={'common', 'core', 'uncommon', 'obscure'}
-#[derive(Deserialize, Serialize,Clone, Copy,PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Cat {
     Common,
@@ -24,7 +29,7 @@ enum Cat {
     Uncommon,
     Obscure,
 }
-#[derive(Deserialize, Serialize, Clone,PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 struct Word {
     word: String,
     #[serde(rename = "usage_category")]
@@ -60,23 +65,25 @@ fn get_words() -> HashMap<String, Word> {
         return words;
     }
 }
-#[derive(Hash,PartialEq, Eq,Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 enum Special {
-    StartUppercase,
-    BeginAscii,
-    EndAscii
+    StartUppercase = 0xf8,
+    BeginAscii = 0xff,
+    EndAscii = 0xfe,
 }
-#[derive(Hash,PartialEq, Eq,Clone)]
+#[derive(Hash, PartialEq, Eq, Clone)]
 enum WordOrSpecial {
     Word(String),
-    Special(Special)
+    Special(Special),
 }
 fn gen_conversions(words: HashMap<String, Word>) -> Words {
     let mut w: Vec<Word> = words.into_values().collect();
     w.sort_by_key(|s: &Word| -> String { s.word.clone() });
-    
-    let e = w.into_iter().enumerate()
-        .map(|(i,v)| {(i as u8, WordOrSpecial::Word(v.word))});
+
+    let e = w
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (i as u8, WordOrSpecial::Word(v.word)));
     let mut from_tpc: HashMap<u8, WordOrSpecial> = HashMap::from_iter(e);
     from_tpc.insert(0xfd, WordOrSpecial::Word(".".to_string()));
     from_tpc.insert(0xfc, WordOrSpecial::Word(",".to_string()));
@@ -88,16 +95,17 @@ fn gen_conversions(words: HashMap<String, Word>) -> Words {
     from_tpc.insert(0xfe, WordOrSpecial::Special(Special::EndAscii));
     from_tpc.insert(0xf8, WordOrSpecial::Special(Special::StartUppercase));
 
-    let to = 
-    from_tpc.iter().map(|(k,v)| -> (WordOrSpecial, u8) {(v.clone(),*k)});
-    let to_tpc:HashMap<WordOrSpecial, u8> = HashMap::from_iter(to); 
+    let to = from_tpc
+        .iter()
+        .map(|(k, v)| -> (WordOrSpecial, u8) { (v.clone(), *k) });
+    let to_tpc: HashMap<WordOrSpecial, u8> = HashMap::from_iter(to);
     Words { to_tpc, from_tpc }
 }
 
-fn compress(conv:&Words,text:&String) -> Vec<u8> {
+fn compress(conv: &Words, text: &String) -> Vec<u8> {
     let words = text.split_whitespace();
-    const PUNCT: [char;5] = ['.',',',':','!','?'];
-    let mut end:Option<u8> = None;
+    const PUNCT: [char; 5] = ['.', ',', ':', '!', '?'];
+    let mut end: Option<u8> = None;
     let mut out: Vec<u8> = Vec::new();
     // header: [TPC]ompress, version
     let tpc: String = "TPC".to_string();
@@ -110,30 +118,99 @@ fn compress(conv:&Words,text:&String) -> Vec<u8> {
         let mut bare_word: String = word.to_string();
         if let Some(x) = word.chars().last() {
             if PUNCT.contains(&x) {
-                end=Some(conv.to_tpc[&WordOrSpecial::Word(x.to_string())]);
-                bare_word=bare_word.strip_suffix(x).unwrap().to_string();
+                end = Some(conv.to_tpc[&WordOrSpecial::Word(x.to_string())]);
+                bare_word = bare_word.strip_suffix(x).unwrap().to_string();
             }
         }
         if let Some(c) = bare_word.chars().next() {
             if c.is_uppercase() {
                 out.push(conv.to_tpc[&WordOrSpecial::Special(Special::StartUppercase)]);
-                bare_word=bare_word.to_lowercase();
+                bare_word = bare_word.to_lowercase();
             }
         }
         out.push(conv.to_tpc[&WordOrSpecial::Word(bare_word)]);
         if let Some(end) = end {
             out.push(end)
         }
+        end = None;
+    }
+    out
+}
+fn verify(i: &mut usize, data: &Vec<u8>) {
+    let header: &[u8] = data
+        .get(0..6)
+        .expect("expected TPC header. Maybe wrong file type");
+    let tpc = header.get(0..3).unwrap();
+    if tpc != "TPC".as_bytes() {
+        panic!("expected TPC in header. Maybe wrong file type");
+    }
+    *i += header.len();
+}
+fn decompress(conv: &Words, data: &Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    let len = data.len();
+    //skip header
+    debug!("verifying header");
+    verify(&mut i, data);
+
+    debug!("decompressing");
+    while i < len {
+        let byte = &data[i];
+        if let Some(word) = conv.from_tpc.get(byte) {
+            match word {
+                WordOrSpecial::Word(word) => {
+                    out.push_str(word);
+                }
+                WordOrSpecial::Special(Special::StartUppercase) => {
+                    const EXPECTED_WORD: &str = "expected word after uppercase byte";
+                    i += 1;
+                    let next = data.get(i).expect(EXPECTED_WORD);
+                    let word = conv.from_tpc.get(next).expect(EXPECTED_WORD);
+                    match word {
+                        WordOrSpecial::Special(x) => {
+                            panic!("{} but got {:?}", EXPECTED_WORD, x);
+                        }
+                        WordOrSpecial::Word(word) => {
+                            let mut copy: String = word.clone();
+                            let copy: &mut str = copy.as_mut_str();
+                            if copy.len() > 0 {
+                                let first = copy.get_mut(0..0usize);
+                                if let Some(first) = first {
+                                    first.make_ascii_uppercase();
+                                }
+                            }
+                            out.push_str(&copy);
+                        }
+                    }
+                }
+                WordOrSpecial::Special(Special::BeginAscii) => {
+                    i += 1;
+                    let mut next = data.get(i).expect("Expected ASCII Character");
+                    while next != &(Special::EndAscii as u8) {
+                        let bytes = [*next];
+                        let s = std::str::from_utf8(&bytes).unwrap();
+                        out.push_str(s);
+                        i += 1;
+                        next = data.get(i).expect("Expected ASCII Character");
+                    }
+                }
+                WordOrSpecial::Special(Special::EndAscii) => {
+                    panic!("Found EndAscii before BeginAscii");
+                }
+            }
+            i += 1;
+        }
     }
     out
 }
 
-#[derive(Clone, Copy,ValueEnum)]
+#[derive(Clone, Copy, ValueEnum, Debug)]
 enum DeComp {
     Decompress,
-    Compress
+    Compress,
 }
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Turn debugging information on
@@ -141,38 +218,61 @@ struct Args {
     debug: bool,
 
     #[arg(value_enum)]
-    decomp:DeComp,
+    decomp: DeComp,
 
     #[arg()]
     file: PathBuf,
 
-    
-    #[arg(short,long,default_value="out.tpc")]
+    #[arg(short, long, default_value = "out.tpc")]
     out: PathBuf,
 }
 
 fn main() {
+    colog::init();
     let words = gen_conversions(get_words());
     let a = Args::parse();
+
+    trace!("Args: {:?}", a);
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(false)
+        .read(true)
+        .write(false)
+        .open(a.file)
+        .unwrap();
+    let mut outf = std::fs::OpenOptions::new()
+        .create(true)
+        .read(false)
+        .write(true)
+        .append(false)
+        .open(a.out)
+        .unwrap();
     match a.decomp {
         DeComp::Compress => {
-            let mut f = std::fs::OpenOptions::new()
-                .create(false)
-                .read(true)
-                .write(false)
-                .open(a.file).unwrap();
             let mut text = String::new();
             f.read_to_string(&mut text).unwrap();
 
-            let mut outf = std::fs::OpenOptions::new()
-                .create(true)
-                .read(false)
-                .write(true)
-                .append(false)
-                .open(a.out).unwrap();
-            outf.write(&compress(&words, &text)).unwrap();
+            let out = compress(&words, &text);
+            outf.write(&out).unwrap();
+            let in_size = text.len() as f32;
+            let out_size = out.len() as f32;
+            let change: f32 = in_size / out_size;
+            let percent = (change * 100.) as u32;
+            println!("Deflated {}", percent);
         }
-        DeComp::Decompress => {}
+        DeComp::Decompress => {
+            let mut data = Vec::new();
+            f.read_to_end(&mut data).unwrap();
+
+            let out_string = decompress(&words, &data);
+            let out = out_string.as_bytes();
+            outf.write(out).unwrap();
+            let in_size = data.len() as f32;
+            let out_size = out.len() as f32;
+            let change: f32 = in_size / out_size;
+            let percent = (change * 100.) as u32;
+            println!("Inflated {}", percent);
+        }
     };
-    println!("Hello, world!");
+    println!("Done!");
 }
