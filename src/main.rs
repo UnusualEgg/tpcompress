@@ -1,26 +1,19 @@
 use clap::Parser;
 use clap_derive::ValueEnum;
 use core::panic;
-use log::{debug, info, trace, LevelFilter};
+use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
     path::PathBuf,
 };
 
 const LINKU_API: &str = "https://api.linku.la/v1/words";
-
-//ends = ['.',',',':','!','?']
-//  "usage_category"
-//  "word"
-
 // 1 byte per word
-// get input file
-
-// number=word in alpha order
-
 //cats={'common', 'core', 'uncommon', 'obscure'}
+
+
 #[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Cat {
@@ -90,6 +83,8 @@ fn gen_conversions(words: HashMap<String, Word>) -> Words {
     from_tpc.insert(0xfb, WordOrSpecial::Word(":".to_string()));
     from_tpc.insert(0xfa, WordOrSpecial::Word("!".to_string()));
     from_tpc.insert(0xf9, WordOrSpecial::Word("?".to_string()));
+    from_tpc.insert(0xf7, WordOrSpecial::Word("\n".to_string()));
+    from_tpc.insert(0xf6, WordOrSpecial::Word("\t".to_string()));
 
     from_tpc.insert(0xff, WordOrSpecial::Special(Special::BeginAscii));
     from_tpc.insert(0xfe, WordOrSpecial::Special(Special::EndAscii));
@@ -102,10 +97,33 @@ fn gen_conversions(words: HashMap<String, Word>) -> Words {
     Words { to_tpc, from_tpc }
 }
 
+const PUNCT: [char; 7] = ['.', ',', ':', '!', '?','\n','\t'];
+
+fn get_punct(s:&str,conv: &Words) -> Option<(Vec<u8>,String)> {
+    let mut v = Vec::new();
+    let mut c: VecDeque<char> = s.chars().collect();
+    let mut copy: Option<String> = None;
+    while let Some(x) = c.back() {
+        if !PUNCT.contains(&x) {
+            break;
+        }
+        if copy.is_none() {
+            copy=Some(s.to_string());
+        }
+        v.push(conv.to_tpc[&WordOrSpecial::Word(x.to_string())]);
+        if let Some(inner) = copy {
+            copy = Some(inner.strip_suffix([*x]).unwrap().to_string());
+        }
+        c.pop_back();
+    }
+    if v.len()>0 {
+        return Some((v,copy.unwrap()));
+    }
+    return None;
+}
 fn compress(conv: &Words, text: &String) -> Vec<u8> {
-    let words = text.split_whitespace();
-    const PUNCT: [char; 5] = ['.', ',', ':', '!', '?'];
-    let mut end: Option<u8> = None;
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut end: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
     // header: [TPC]ompress, version
     let tpc: String = "TPC".to_string();
@@ -114,25 +132,37 @@ fn compress(conv: &Words, text: &String) -> Vec<u8> {
     out.push(env!("CARGO_PKG_VERSION_MINOR").parse().unwrap());
     out.push(env!("CARGO_PKG_VERSION_PATCH").parse().unwrap());
 
-    for word in words {
+    let mut i = 0;
+    let len = words.len();
+    while i<len {
+        let word = words[i];
+        //won't include any punctuation or whitespace
         let mut bare_word: String = word.to_string();
-        if let Some(x) = word.chars().last() {
-            if PUNCT.contains(&x) {
-                end = Some(conv.to_tpc[&WordOrSpecial::Word(x.to_string())]);
-                bare_word = bare_word.strip_suffix(x).unwrap().to_string();
-            }
+        
+        if let Some((new_end,new_word)) = get_punct(word, conv) {
+            bare_word= new_word;
+            end = new_end;
         }
+        
+        //check if this is proper (capitalize)
         if let Some(c) = bare_word.chars().next() {
             if c.is_uppercase() {
                 out.push(conv.to_tpc[&WordOrSpecial::Special(Special::StartUppercase)]);
                 bare_word = bare_word.to_lowercase();
             }
         }
-        out.push(conv.to_tpc[&WordOrSpecial::Word(bare_word)]);
-        if let Some(end) = end {
-            out.push(end)
+        if let Some(bare_word) = conv.to_tpc.get(&WordOrSpecial::Word(bare_word)) {
+            out.push(*bare_word);
+        } else {
+            out.push(Special::BeginAscii as u8);
+            out.extend(word.as_bytes());
+            out.push(Special::EndAscii as u8);
         }
-        end = None;
+        if !end.is_empty() {
+            out.extend(&end);
+        }
+        end.clear();
+        i+=1;
     }
     out
 }
@@ -146,6 +176,14 @@ fn verify(i: &mut usize, data: &Vec<u8>) {
     }
     *i += header.len();
 }
+//source: https://stackoverflow.com/a/38406885
+fn first_uppercase(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().chain(c).collect(),
+    }
+}
 fn decompress(conv: &Words, data: &Vec<u8>) -> String {
     let mut out = String::new();
     let mut i = 0;
@@ -153,6 +191,7 @@ fn decompress(conv: &Words, data: &Vec<u8>) -> String {
     //skip header
     debug!("verifying header");
     verify(&mut i, data);
+    let begin = i;
 
     debug!("decompressing");
     while i < len {
@@ -160,6 +199,9 @@ fn decompress(conv: &Words, data: &Vec<u8>) -> String {
         if let Some(word) = conv.from_tpc.get(byte) {
             match word {
                 WordOrSpecial::Word(word) => {
+                    if i!=begin&&!(word.len()>0&&PUNCT.contains(&word.chars().next().unwrap())) {
+                        out.push(' ');
+                    }
                     out.push_str(word);
                 }
                 WordOrSpecial::Special(Special::StartUppercase) => {
@@ -172,19 +214,18 @@ fn decompress(conv: &Words, data: &Vec<u8>) -> String {
                             panic!("{} but got {:?}", EXPECTED_WORD, x);
                         }
                         WordOrSpecial::Word(word) => {
-                            let mut copy: String = word.clone();
-                            let copy: &mut str = copy.as_mut_str();
-                            if copy.len() > 0 {
-                                let first = copy.get_mut(0..0usize);
-                                if let Some(first) = first {
-                                    first.make_ascii_uppercase();
-                                }
+                            if i!=begin&&!(word.len()>0&&PUNCT.contains(&word.chars().next().unwrap())) {
+                                out.push(' ');
                             }
+                            let copy = first_uppercase(word);
                             out.push_str(&copy);
                         }
                     }
                 }
                 WordOrSpecial::Special(Special::BeginAscii) => {
+                    if i!=begin {
+                        out.push(' ');
+                    }
                     i += 1;
                     let mut next = data.get(i).expect("Expected ASCII Character");
                     while next != &(Special::EndAscii as u8) {
@@ -258,7 +299,7 @@ fn main() {
             let out_size = out.len() as f32;
             let change: f32 = in_size / out_size;
             let percent = (change * 100.) as u32;
-            println!("Deflated {}", percent);
+            println!("Deflated {}%", percent);
         }
         DeComp::Decompress => {
             let mut data = Vec::new();
@@ -271,7 +312,7 @@ fn main() {
             let out_size = out.len() as f32;
             let change: f32 = in_size / out_size;
             let percent = (change * 100.) as u32;
-            println!("Inflated {}", percent);
+            println!("Inflated {}%", percent);
         }
     };
     println!("Done!");
